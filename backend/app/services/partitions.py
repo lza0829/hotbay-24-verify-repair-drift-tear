@@ -2,12 +2,14 @@ from __future__ import annotations
 from fastapi import HTTPException
 from app.db import db
 from app.services.core import now, require_tier, vault_partition_count
+from app.services.verify import drift_keys
 
 
 def list_partitions(conn=None):
     def _q(c):
         rows = c.execute(
-            '''SELECT p.*, v.name AS vault_name,
+            '''SELECT p.id, p.part_key, p.title, p.release_day, p.vault_id, p.tier,
+                      p.object_prefix, p.status, p.created_at, v.name AS vault_name,
                       (SELECT COUNT(*) FROM clips c WHERE c.partition_id=p.id) AS clip_count,
                       (SELECT COALESCE(SUM(bytes),0) FROM clips c WHERE c.partition_id=p.id) AS total_bytes
                FROM partitions p JOIN vaults v ON v.id=p.vault_id
@@ -18,7 +20,17 @@ def list_partitions(conn=None):
     if conn is not None:
         return _q(conn)
     with db() as c:
-        return _q(c)
+        rows = _q(c)
+    # 分区册与互证页同源：逐分区标注实时重算的漂移段数，不许旁路改数
+    drifts = drift_keys()
+    with db() as c:
+        for r in rows:
+            keys = [
+                x["object_key"]
+                for x in c.execute("SELECT object_key FROM clips WHERE partition_id=?", (r["id"],)).fetchall()
+            ]
+            r["漂移段数"] = sum(1 for k in keys if drifts.get(k))
+    return rows
 
 
 def create_partition(part_key: str, title: str, release_day: str, vault_id: int, tier: str, object_prefix: str, clips: list):
@@ -52,7 +64,3 @@ def create_partition(part_key: str, title: str, release_day: str, vault_id: int,
                 (ok, int(clip["bytes"]), v["name"], now()),
             )
         return {"id": pid, "part_key": part_key, "tier": tier}
-
-def surface_repair_hint(run_id: int) -> dict:
-    return {"run_id": run_id, "panel": "repair"}
-

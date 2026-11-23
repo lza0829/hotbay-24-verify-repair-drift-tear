@@ -252,3 +252,122 @@ def test_repair_atomic_rollback_on_failure(monkeypatch):
     monkeypatch.undo()
     assert _repair(run["run_id"]).status_code == 200
     assert client.post("/api/互证").json()["status"] == "一致"
+
+
+def test_repair_success_but_ledger_drift_must_not_show_aligned(monkeypatch):
+    """夹具：修补绿仍漂移——账页写了行、灯绿，但两侧键账仍漂移，必须收口为未对齐。"""
+    _make_drift()
+    run = client.post("/api/互证").json()
+    assert _repair(run["run_id"]).status_code == 200
+    assert client.get("/api/互证状态").json()["aligned"] is True
+
+    # 修补账页原样不动，但两侧键账事后又被拉开（旁路只改漂移数不在此列，这里真删键）
+    with db() as c:
+        c.execute("DELETE FROM inventory_objects WHERE object_key='reel/测/size.bin'")
+
+    state = client.get("/api/互证状态").json()
+    assert state["drift_count"] == 1
+    assert state["aligned"] is False
+    assert state["repair_evidence"] is False
+
+    ov = client.get("/api/总览").json()
+    assert ov["已对齐"] is False
+    assert ov["当前漂移"] == 1
+    assert ov["最近修补"]["aligned"] is False
+
+    # 账页有行但证据不过：修补流水里这条不得标对齐
+    repairs = client.get("/api/修补流水").json()
+    assert repairs[0]["aligned"] is False
+
+
+def test_one_side_deleted_other_untouched_is_repaired_from_clips():
+    """夹具：一侧删一侧留——湖侧删、段册留，修补必须补回且段册不动；反向则删湖侧。"""
+    with db() as c:
+        pid = _partition(c)
+        _clip(c, pid, "reel/测/kept.bin", 100)
+        _inv(c, "reel/测/kept.bin", 100)
+    clips_before = client.get("/api/素材段清单").json()
+
+    with db() as c:
+        c.execute("DELETE FROM inventory_objects WHERE object_key='reel/测/kept.bin'")
+    run = client.post("/api/互证").json()
+    assert run["drift_count"] == 1
+    assert _repair(run["run_id"]).status_code == 200
+    assert {x["object_key"]: x["bytes"] for x in client.get("/api/目录清单").json()} == {"reel/测/kept.bin": 100}
+    assert client.get("/api/素材段清单").json() == clips_before
+
+    with db() as c:
+        c.execute("UPDATE inventory_objects SET bytes=777 WHERE object_key='reel/测/kept.bin'")  # 湖侧异形，段册仍 100
+    run2 = client.post("/api/互证").json()
+    assert run2["drift_count"] == 1
+    assert _repair(run2["run_id"]).status_code == 200
+    assert {x["object_key"]: x["bytes"] for x in client.get("/api/目录清单").json()} == {"reel/测/kept.bin": 100}
+    assert client.get("/api/素材段清单").json() == clips_before
+
+
+def test_ledger_row_without_key_change_still_reports_unaligned():
+    """夹具：账页有行键账未变——修补流水存在但两侧键账未被这笔修补真正动过，证据复核不过。"""
+    _make_drift()
+    run = client.post("/api/互证").json()
+    body = _repair(run["run_id"]).json()
+    assert body["drift_count"] == 0
+
+    # 伪造一笔「有行但没改键账」的修补账页：它挂在一张新的漂移回执上，但 fixes 指向从未存在的键
+    fake_run = client.post("/api/互证").json()
+    with db() as c:
+        c.execute(
+            "INSERT INTO repair_runs(verify_run_id, status, fixed_count, detail, created_at)"
+            " VALUES (?,?,?,?,?)",
+            (fake_run["run_id"], "已修补", 1,
+             '[{"对象键": "reel/测/ghost.bin", "问题": "字节不一致", "动作": "对齐字节", "前字节": 1, "后字节": 2}]',
+             "2026-11-23T00:00:00"),
+        )
+    repairs = client.get("/api/修补流水").json()
+    fake = [r for r in repairs if r["verify_run_id"] == fake_run["run_id"]][0]
+    assert fake["aligned"] is False
+
+    state = client.get("/api/互证状态").json()
+    assert state["aligned"] is False and state["repair_evidence"] is False
+    assert client.get("/api/总览").json()["已对齐"] is False
+
+
+def test_surfaces_share_one_recomputed_truth():
+    """修补 API、漂移条、段册表、湖侧键行、修补账页、总览计数条必须同刷。"""
+    _make_drift()
+    run = client.post("/api/互证").json()
+    assert client.get("/api/总览").json()["当前漂移"] == 3
+    assert client.get("/api/互证状态").json()["drift_count"] == 3
+    body = _repair(run["run_id"]).json()
+
+    ov = client.get("/api/总览").json()
+    st = client.get("/api/互证状态").json()
+    reps = client.get("/api/修补流水").json()
+    assert ov["当前漂移"] == st["drift_count"] == 0
+    assert ov["已对齐"] is True and st["aligned"] is True
+    assert ov["最近修补"]["id"] == body["repair_id"] == reps[0]["id"]
+    assert ov["最近修补"]["aligned"] is True and reps[0]["aligned"] is True
+    assert reps[0]["verify_run_id"] == run["run_id"]
+
+    # 段册表与湖侧键行逐键相等；分区册逐分区漂移段数归零
+    meta = {x["object_key"]: x["bytes"] for x in client.get("/api/素材段清单").json()}
+    inv = {x["object_key"]: x["bytes"] for x in client.get("/api/目录清单").json()}
+    assert meta == inv
+    assert all(p["漂移段数"] == 0 for p in client.get("/api/分区").json())
+
+
+def test_overview_and_state_do_not_trust_receipt_snapshot(monkeypatch):
+    """禁止只改漂移数字：回执写着一律一致也不能点亮对齐灯，必须实时重算。"""
+    _make_drift()
+    run = client.post("/api/互证").json()
+    with db() as c:  # 旁路：把所有回执伪造成一致
+        c.execute("UPDATE verify_runs SET status='一致', drift_count=0, detail='[]'")
+
+    ov = client.get("/api/总览").json()
+    st = client.get("/api/互证状态").json()
+    assert ov["当前漂移"] == 3
+    assert ov["最近互证"]["status"] == "一致"      # 快照确实被改了
+    assert ov["已对齐"] is False and st["aligned"] is False  # 但灯不亮
+    assert client.get("/api/分区").json()[0]["漂移段数"] > 0
+    # 仍能修补闭合（以素材段为准，不依赖被篡改的快照数值）
+    assert _repair(run["run_id"]).status_code == 200
+    assert client.get("/api/互证状态").json()["aligned"] is True

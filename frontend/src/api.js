@@ -29,6 +29,7 @@ export const api = {
   inventory: () => req('/目录清单'),
   clipsLedger: () => req('/素材段清单'),
   verifyRuns: () => req('/互证流水'),
+  verifyState: () => req('/互证状态'),
   repairs: () => req('/修补流水'),
   runVerify: () => req('/互证', { method: 'POST', body: '{}' }),
   repair: (runId) => req(`/互证/${runId}/修补`, { method: 'POST', body: '{}' }),

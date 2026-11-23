@@ -4,7 +4,6 @@ import sqlite3
 from fastapi import HTTPException
 from app.db import db
 from app.services.core import now
-from app.services import repair_surface
 
 # 漂移修补全局唯一真源：以在册素材段为准。
 #   - 按在册/已过期分区的素材段集合，对齐湖对象行（inventory_objects）：
@@ -43,13 +42,24 @@ def current_drifts(conn):
     return drifts, meta_keys, inv_keys
 
 
+def drift_keys():
+    """实时漂移键 → 问题，供段册表、湖侧键行、分区册逐行标注。"""
+    with db() as conn:
+        drifts, _, _ = current_drifts(conn)
+        return {d["对象键"]: d["问题"] for d in drifts}
+
+
 def inventory_list():
     with db() as conn:
         return [dict(r) for r in conn.execute("SELECT * FROM inventory_objects ORDER BY object_key").fetchall()]
 
 
 def clips_ledger():
-    """素材段表：互证口径内的在册素材段（修补真源侧，修补不得改动）。"""
+    """素材段表：互证口径内的在册素材段（修补真源侧，修补不得改动）。
+
+    返回行只含素材段事实字段——修补前后必须逐字段相等，这是「素材段不因
+    修补改动」的证据。漂移标注由 /互证状态 的实时漂移列表按对象键合并。
+    """
     with db() as conn:
         rows = conn.execute(
             '''SELECT c.id, c.object_key, c.bytes, c.entered_day, c.note,
@@ -96,12 +106,16 @@ def repair_drift(run_id: int):
         run = conn.execute("SELECT * FROM verify_runs WHERE id=?", (run_id,)).fetchone()
         if not run:
             raise HTTPException(404, detail="互证回执不存在")
-        if run["status"] != "漂移":
-            raise HTTPException(400, detail="该回执无漂移，无需修补")
         if conn.execute("SELECT 1 FROM repair_runs WHERE verify_run_id=?", (run_id,)).fetchone():
             raise HTTPException(409, detail="该回执已修补闭合，禁止重复修补")
 
+        # 准入看事务内重算的真实漂移，不看回执快照：
+        # - 真实有漂移：无论快照写什么都必须能修补（回执被改成「一致」也不能挡）；
+        # - 真实无漂移：仅当回执本就写着「一致」才拒绝。回执仍是「漂移」说明
+        #   漂移已被并发那一笔撮合，本笔以零修正闭合，不两边各删各的。
         drifts, _, _ = current_drifts(conn)
+        if not drifts and run["status"] != "漂移":
+            raise HTTPException(400, detail="当前无漂移，无需修补")
         ts = now()
         fixes = []
         for d in drifts:
@@ -134,6 +148,7 @@ def repair_drift(run_id: int):
 
         left, _, _ = current_drifts(conn)
         if left:
+            # 修补成功必须能由段册∪湖侧键集合重放为零漂移；否则整笔回滚、熄灭成功灯
             raise HTTPException(500, detail="修补后复证仍漂移，已整体回滚")
         try:
             cur = conn.execute(
@@ -142,17 +157,82 @@ def repair_drift(run_id: int):
             )
         except sqlite3.IntegrityError:
             raise HTTPException(409, detail="该回执已修补闭合，禁止重复修补")
-        # 修补后复证：回执、流水、总览漂移徽章同刷闭合
-        conn.execute(
-            "INSERT INTO verify_runs(status, drift_count, detail, created_at) VALUES ('一致', 0, '[]', ?)",
-            (ts,),
+        # 修后复证回执取同事务内重算结果（此刻必为零漂移），与修正、流水同成败
+        recheck = conn.execute(
+            "INSERT INTO verify_runs(status, drift_count, detail, created_at) VALUES (?,?,?,?)",
+            ("一致", len(left), json.dumps(left, ensure_ascii=False), ts),
         )
         return {
             "repair_id": cur.lastrowid,
             "verify_run_id": run_id,
+            "recheck_run_id": recheck.lastrowid,
             "status": "已修补",
             "fixed_count": len(fixes),
+            "drift_count": len(left),
             "fixes": fixes,
+        }
+
+
+def repair_still_aligned(conn, fixes):
+    """修补成功灯的证据：账页每条动作必须能在湖侧键账上复核成声明的终态。
+
+    - 补齐湖对象行：湖侧现有该键且字节等于后字节；
+    - 删除湖对象行：湖侧已无该键；
+    - 对齐字节：湖侧字节等于后字节，且前后字节确有变化。
+
+    只有账页、没有真实键账变化的「假修补」在这里被识破（幽灵键不在湖侧，
+    声明的终态无法重放）。全局是否对齐由 current_drifts 实时重算决定；
+    本函数只回答「这一笔修补的成功是否名副其实」，不替代漂移重算。
+    """
+    inv = {
+        r["object_key"]: r["bytes"]
+        for r in conn.execute("SELECT object_key, bytes FROM inventory_objects").fetchall()
+    }
+    for f in fixes or []:
+        key = f.get("对象键")
+        action = f.get("动作")
+        before = f.get("前字节")
+        after = f.get("后字节")
+        if not key:
+            return False
+        if action == "补齐湖对象行":
+            if before is not None or after is None or inv.get(key) != after:
+                return False
+        elif action == "删除湖对象行":
+            if after is not None or before is None or key in inv:
+                return False
+        elif action == "对齐字节":
+            if before is None or after is None or before == after or inv.get(key) != after:
+                return False
+        else:
+            return False
+    return True
+
+
+def alignment_state():
+    """互证页对齐灯的实时口径：当前漂移重算 + 最近修补账页复核。
+
+    对齐灯不得由回执快照点亮：段册∪湖侧键集合仍漂移，或最近修补账页
+    在当前键账上复核不过，一律视为未对齐。
+    """
+    with db() as conn:
+        drifts, meta_keys, inv_keys = current_drifts(conn)
+        last = conn.execute(
+            "SELECT id, verify_run_id, detail FROM repair_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        repair_aligned = True
+        last_repair_id = None
+        if last:
+            last_repair_id = last["id"]
+            repair_aligned = repair_still_aligned(conn, json.loads(last["detail"] or "[]"))
+        return {
+            "drift_count": len(drifts),
+            "drifts": drifts,
+            "aligned": not drifts and repair_aligned,
+            "repair_evidence": repair_aligned,
+            "last_repair_id": last_repair_id,
+            "meta_count": len(meta_keys),
+            "inventory_count": len(inv_keys),
         }
 
 
@@ -186,13 +266,8 @@ def list_repairs():
         for r in rows:
             d = dict(r)
             d["fixes"] = json.loads(d.pop("detail"))
+            # 账页「对齐证据」实时复核：账页有行不代表两侧键账仍对齐
+            d["aligned"] = repair_still_aligned(conn, d["fixes"])
             out.append(d)
         return out
-
-_repair_drift_impl = repair_drift
-
-
-def repair_drift(run_id: int):
-    out = _repair_drift_impl(run_id)
-    return repair_surface.after_repair(out)
 

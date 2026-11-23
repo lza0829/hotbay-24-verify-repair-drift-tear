@@ -52,10 +52,10 @@ export default function Partitions() {
       </form>
       <div className="table-wrap">
         <table>
-          <thead><tr><th>分区键</th><th>片名</th><th>温层</th><th>片库间</th><th>段数</th><th>状态</th></tr></thead>
+          <thead><tr><th>分区键</th><th>片名</th><th>温层</th><th>片库间</th><th>段数</th><th>漂移段</th><th>状态</th></tr></thead>
           <tbody>
             {rows.map(r => (
-              <tr key={r.id}><td>{r.part_key}</td><td>{r.title}</td><td>{r.tier}</td><td>{r.vault_name}</td><td>{r.clip_count}</td><td>{r.status}</td></tr>
+              <tr key={r.id} className={r.漂移段数 ? 'drift-row' : ''}><td>{r.part_key}</td><td>{r.title}</td><td>{r.tier}</td><td>{r.vault_name}</td><td>{r.clip_count}</td><td className={r.漂移段数 ? 'err' : 'muted'}>{r.漂移段数 ?? 0}</td><td>{r.status}</td></tr>
             ))}
           </tbody>
         </table>

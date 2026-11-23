@@ -25,6 +25,11 @@ def repairs():
     return svc.list_repairs()
 
 
+@router.get("/互证状态")
+def state():
+    return svc.alignment_state()
+
+
 @router.post("/互证")
 def run():
     return svc.run_verify()

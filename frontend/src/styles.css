@@ -108,6 +108,8 @@ body {
 .stat strong { font-size: 1.8rem; color: var(--amber); font-family: "ZCOOL QingKe HuangYou", sans-serif; }
 .stat.drift { border-color: var(--danger); box-shadow: 0 0 12px rgba(255,107,107,.25); }
 .stat.drift strong { color: var(--danger); }
+.stat.ok { border-color: var(--ok); box-shadow: 0 0 12px rgba(125,206,160,.2); }
+.stat.ok strong { color: var(--ok); }
 .receipt { border-top: 1px dashed #5a3040; margin-top: 14px; padding-top: 10px; }
 .panel, .card {
   background: rgba(20, 10, 14, .72);
@@ -138,6 +140,7 @@ button.ghost { background: transparent; color: var(--amber); border: 1px solid v
 table { width: 100%; border-collapse: collapse; font-size: .92rem; }
 th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #4a3038; }
 th { color: var(--amber); font-weight: 600; }
+tr.drift-row td { background: rgba(255,107,107,.07); }
 .plain { padding-left: 1.1em; color: var(--muted); }
 .msg { color: var(--ok); }
 .err { color: var(--danger); }
